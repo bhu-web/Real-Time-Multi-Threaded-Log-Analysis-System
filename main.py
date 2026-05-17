@@ -40,25 +40,43 @@ class LogFileHandler(FileSystemEventHandler):
     def __init__(self, file_path):
         self.file_path = os.path.abspath(file_path)
         self.last_size = os.path.getsize(self.file_path)
+        # Keeps track of uncompleted fragments from partial file-system flushes
+        self.leftover_fragment = "" 
 
     def on_modified(self, event):
-        # We only care about modifications to our specific target log file
         if os.path.abspath(event.src_path) == self.file_path:
-            current_size = os.path.getsize(self.file_path)
-            
+            try:
+                current_size = os.path.getsize(self.file_path)
+            except FileNotFoundError:
+                return # Guard against edge cases where files are rotated mid-event
+
             if current_size > self.last_size:
-                # Settle-time to ensure the OS stream is flushed
-                time.sleep(0.05) 
-                
+                # IMMEDIATE opportunistic read—no artificial sleep/stalling allowed
                 with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     f.seek(self.last_size)
-                    new_lines = f.read().splitlines()
+                    raw_chunk = f.read()
+                
+                # Update pointer immediately to free the OS event loop
+                self.last_size = current_size
+
+                if raw_chunk:
+                    # Prepend any unfinished text fragment left over from the last partial write
+                    full_content = self.leftover_fragment + raw_chunk
                     
-                    for line in new_lines:
+                    # Split into lines manually to check the final line's boundary status
+                    lines = full_content.splitlines()
+                    
+                    # If the chunk does NOT end with a newline character, the last item
+                    # in 'lines' is a partial write fragment. We must store it for next time.
+                    if not full_content.endswith('\n') and lines:
+                        self.leftover_fragment = lines.pop()
+                    else:
+                        self.leftover_fragment = ""
+
+                    # Dispatch completed, well-formed lines to the analysis engine
+                    for line in lines:
                         if line.strip():
                             log_queue.put(line)
-                            
-                self.last_size = current_size
 
 def start_event_producer():
     log_dir = os.path.dirname(os.path.abspath(LOG_FILE))
