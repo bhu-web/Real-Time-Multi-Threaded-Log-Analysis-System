@@ -7,6 +7,8 @@ import sqlite3
 
 # SHARED INFRASTRUCTURE
 log_queue = queue.Queue(maxsize=50)
+# queue dedicated for database tasks
+db_queue = queue.Queue() 
 # Use absolute paths to avoid confusion
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "logs", "server.log")
@@ -51,36 +53,51 @@ def log_producer():
         time.sleep(0.5)
         
 def log_consumer(worker_id):
-    print(f"[Consumer {worker_id}] Worker online.")
     while True:
         line = log_queue.get()
+        clean_line = line.encode('ascii', 'ignore').decode('ascii').strip()
         
-        # CLEANING: Remove any non-readable characters and extra spaces
-        clean_line = "".join(char for char in line if char.isprintable()).strip()
-        
-        # AGGRESSIVE SEARCH: Look for 'ERROR' anywhere in the line
-        if "ERROR" in clean_line.upper() or "CRITICAL" in clean_line.upper():
-            level = "ERROR" if "ERROR" in clean_line.upper() else "CRITICAL"
-            print(f"!!! [Consumer {worker_id}] Found {level} in: {clean_line}")
+        if re.search(r"ERROR|CRITICAL", clean_line, re.IGNORECASE):
+            level = "CRITICAL" if "CRITICAL" in clean_line.upper() else "ERROR"
             
-            try:
-                conn = sqlite3.connect(DB_FILE)
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO alerts (level, message) VALUES (?, ?)", (level, clean_line))
-                conn.commit()
-                conn.close()
-                print(f"--- [Consumer {worker_id}] Successfully saved to DB.")
-            except Exception as e:
-                print(f"XXX [Consumer {worker_id}] Database Error: {e}")
+            # INSTEAD OF CONNECTING TO DB, WE OFFLOAD TO THE DB QUEUE
+            db_queue.put((level, clean_line))
+            print(f"!!! [Consumer {worker_id}] Found {level}, offloading to DB queue.")
         else:
-            # This helps us see exactly what the consumer is seeing
             print(f"[Consumer {worker_id}] Ignored: '{clean_line}'")
         
         log_queue.task_done()
 
+def log_db_writer():
+    """
+    Dedicated single-thread worker that manages the SQLite connection lifecycle.
+    Bypasses file-locking conflicts entirely.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    while True:
+        # Pulls the structured alert data from the db_queue
+        alert_data = db_queue.get()
+        if alert_data is None:  # Poison pill to gracefully shut down if needed
+            break
+            
+        level, message = alert_data
+        try:
+            cursor.execute("INSERT INTO alerts (level, message) VALUES (?, ?)", (level, message))
+            conn.commit()
+            print("--- [DB Writer] Successfully persisted alert to DB.")
+        except sqlite3.OperationalError as e:
+            print(f"--- [DB Writer] Error writing to database: {e}")
+            
+        db_queue.task_done()
+    
+    conn.close()
+
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=log_producer, daemon=True).start()
+    threading.Thread(target=log_db_writer, daemon=True).start()
     for i in range(2): # 2 consumers is plenty for testing
         threading.Thread(target=log_consumer, args=(i,), daemon=True).start()
 
