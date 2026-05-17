@@ -33,50 +33,100 @@ def init_db():
                       (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, 
                        level TEXT, message TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS system_state 
+                      (key TEXT PRIMARY KEY, value INTEGER)''')
     conn.commit()
     conn.close()
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            pass
+
+def get_stored_offset():
+    """Retrieves the last processed byte position from SQLite. Defaults to 0."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM system_state WHERE key = 'last_log_offset'")
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+def save_stored_offset(offset):
+    """Persists the current byte position to SQLite."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""INSERT INTO system_state (key, value) VALUES ('last_log_offset', ?)
+                          ON CONFLICT(key) DO UPDATE SET value = excluded.value""", (offset,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"--- [System Error] Failed to persist offset state: {e}")
 
 class LogFileHandler(FileSystemEventHandler):
     def __init__(self, file_path):
         self.file_path = os.path.abspath(file_path)
-        self.last_size = os.path.getsize(self.file_path)
-        # Keeps track of uncompleted fragments from partial file-system flushes
-        self.leftover_fragment = "" 
+        
+        # Look up the last known position from the DB instead of assuming the current size!
+        self.last_size = get_stored_offset() 
+        self.leftover_fragment = ""
+        
+        # Run a synchronous initial catchup execution block right at instantiation
+        self.catch_up_on_startup()
+
+    def catch_up_on_startup(self):
+        """Processes logs written while the application was offline."""
+        if not os.path.exists(self.file_path):
+            return
+
+        current_size = os.path.getsize(self.file_path)
+        
+        # If the file shrank (e.g., log rotation or file cleared), reset offset to 0
+        if current_size < self.last_size:
+            print("[System] Log file truncation detected. Resetting pointer offset to 0.")
+            self.last_size = 0
+
+        if current_size > self.last_size:
+            print(f"[System] Catching up on missed logs! Processing bytes {self.last_size} to {current_size}...")
+            # Reuse the exact processing logic block safely
+            self._process_new_bytes(current_size)
+            print("[System] Initial catchup complete. System is fully synced.")
 
     def on_modified(self, event):
         if os.path.abspath(event.src_path) == self.file_path:
             try:
                 current_size = os.path.getsize(self.file_path)
             except FileNotFoundError:
-                return # Guard against edge cases where files are rotated mid-event
+                return
 
             if current_size > self.last_size:
-                # IMMEDIATE opportunistic read—no artificial sleep/stalling allowed
-                with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    f.seek(self.last_size)
-                    raw_chunk = f.read()
-                
-                # Update pointer immediately to free the OS event loop
-                self.last_size = current_size
+                self._process_new_bytes(current_size)
 
-                if raw_chunk:
-                    # Prepend any unfinished text fragment left over from the last partial write
-                    full_content = self.leftover_fragment + raw_chunk
-                    
-                    # Split into lines manually to check the final line's boundary status
-                    lines = full_content.splitlines()
-                    
-                    # If the chunk does NOT end with a newline character, the last item
-                    # in 'lines' is a partial write fragment. We must store it for next time.
-                    if not full_content.endswith('\n') and lines:
-                        self.leftover_fragment = lines.pop()
-                    else:
-                        self.leftover_fragment = ""
+    def _process_new_bytes(self, current_size):
+        """Core non-blocking data extraction routine."""
+        with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            f.seek(self.last_size)
+            raw_chunk = f.read()
+        
+        self.last_size = current_size
+        # Track our pointer state changes safely inside SQLite
+        save_stored_offset(current_size)
 
-                    # Dispatch completed, well-formed lines to the analysis engine
-                    for line in lines:
-                        if line.strip():
-                            log_queue.put(line)
+        if raw_chunk:
+            full_content = self.leftover_fragment + raw_chunk
+            lines = full_content.splitlines()
+            
+            if not full_content.endswith('\n') and lines:
+                self.leftover_fragment = lines.pop()
+            else:
+                self.leftover_fragment = ""
+
+            for line in lines:
+                if line.strip():
+                    log_queue.put(line)
 
 def start_event_producer():
     log_dir = os.path.dirname(os.path.abspath(LOG_FILE))
@@ -176,22 +226,32 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n[System] Shutdown signal received. Initiating graceful termination...")
         
-        # --- THE GRACEFUL SHUTDOWN SEQUENCE ---
-        
-        # Step A: Let Consumers finish whatever lines they already grabbed, then tell them to exit
-        print("[System] Phase 1: Signalling Consumers to halt...")
-        for _ in range(2):
-            log_queue.put(None) # Poison Pill for Consumers (We need to update log_consumer to look for this)
-            
-        for t in consumer_threads:
-            t.join() # Wait until both consumers process their poison pill and exit
-        print("[System] Phase 1 Complete: All Consumers successfully terminated.")
+        # Wrap the shutdown phase in a try/except to swallow accidental double-Ctrl+C triggers
+        try:
+            # Step A: Let Consumers finish whatever lines they already grabbed, then tell them to exit
+            print("[System] Phase 1: Signalling Consumers to halt...")
+            for _ in range(2):
+                log_queue.put(None)
+                
+            for t in consumer_threads:
+                t.join()
+            print("[System] Phase 1 Complete: All Consumers successfully terminated.")
 
-        # Step B: Wait for the Consumer-to-DB queue to completely clear out
-        print("[System] Phase 2: Flushing remaining database queue entries...")
-        db_queue.put(None) # Trigger your poison pill inside log_db_writer
-        
-        db_writer_thread.join() # Wait for SQLite to finish writing every last alert and close cleanly
-        print("[System] Phase 2 Complete: Database layer safely persisted and connection closed.")
-        
-        print("[System] Shutdown successful. Zero data lost. Safe to exit.")
+            # Step B: Wait for the Consumer-to-DB queue to completely clear out
+            print("[System] Phase 2: Flushing remaining database queue entries...")
+            db_queue.put(None)
+            
+            db_writer_thread.join()
+            print("[System] Phase 2 Complete: Database layer safely persisted and connection closed.")
+            
+            print("[System] Shutdown successful. Zero data lost. Safe to exit.")
+            
+        except KeyboardInterrupt:
+            # If the user presses Ctrl+C AGAIN during the shutdown loop, we block it!
+            print("\n[System Warning] Core shutdown in progress! Please wait for database locks to release safely...")
+            # Re-join the DB writer to guarantee data safety regardless of user impatience
+            try:
+                db_writer_thread.join()
+                print("[System] Emergency Override: Database safely persisted before force-exit.")
+            except Exception:
+                pass
