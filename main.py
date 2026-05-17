@@ -4,6 +4,8 @@ import time
 import re
 import os
 import sqlite3
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # SHARED INFRASTRUCTURE
 log_queue = queue.Queue(maxsize=50)
@@ -26,31 +28,47 @@ def init_db():
     conn.commit()
     conn.close()
 
-def log_producer():
-    print(f"[Producer] Monitoring: {LOG_FILE}")
-    last_size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
+class LogFileHandler(FileSystemEventHandler):
+    def __init__(self, file_path):
+        self.file_path = os.path.abspath(file_path)
+        self.last_size = os.path.getsize(self.file_path)
 
-    while True:
-        try:
-            current_size = os.path.getsize(LOG_FILE)
-            if current_size > last_size:
-                time.sleep(0.1)  # Crucial: Give Windows time to finish the write
-                with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                    f.seek(last_size)
-                    content = f.read()
-                    
-                for line in content.splitlines():
-                    if line.strip():
-                        print(f"[Producer] Queued: {line.strip()}")
-                        log_queue.put(line.strip())
-                last_size = current_size
-            elif current_size < last_size:
-                # Handle file being cleared/truncated
-                last_size = current_size
-        except Exception as e:
-            print(f"[Producer] Error: {e}")
+    def on_modified(self, event):
+        # We only care about modifications to our specific target log file
+        if os.path.abspath(event.src_path) == self.file_path:
+            current_size = os.path.getsize(self.file_path)
             
-        time.sleep(0.5)
+            if current_size > self.last_size:
+                # Settle-time to ensure the OS stream is flushed
+                time.sleep(0.05) 
+                
+                with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    f.seek(self.last_size)
+                    new_lines = f.read().splitlines()
+                    
+                    for line in new_lines:
+                        if line.strip():
+                            log_queue.put(line)
+                            
+                self.last_size = current_size
+
+def start_event_producer():
+    log_dir = os.path.dirname(os.path.abspath(LOG_FILE))
+    
+    # Set up the OS directory observer
+    event_handler = LogFileHandler(LOG_FILE)
+    observer = Observer()
+    observer.schedule(event_handler, path=log_dir, recursive=False)
+    observer.start()
+    
+    print("--- [Producer] Event-Driven Watcher started via OS Kernel hooks.")
+    # Keep the thread alive quietly
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
         
 def log_consumer(worker_id):
     while True:
@@ -96,7 +114,7 @@ def log_db_writer():
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=log_producer, daemon=True).start()
+    threading.Thread(target=start_event_producer, daemon=True).start()
     threading.Thread(target=log_db_writer, daemon=True).start()
     for i in range(2): # 2 consumers is plenty for testing
         threading.Thread(target=log_consumer, args=(i,), daemon=True).start()
