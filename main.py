@@ -79,27 +79,28 @@ def start_event_producer():
     observer.join()
         
 def log_consumer(worker_id):
-    # This Regex looks ONLY at the start of the line (^) for the words, 
-    # followed immediately by a colon (:) or a space boundary.
     LOG_LEVEL_PATTERN = re.compile(r"^(ERROR|CRITICAL):", re.IGNORECASE)
 
     while True:
         line = log_queue.get()
+        
+        # POISON PILL CHECK: If the main thread sent None, shut down this worker cleanly
+        if line is None:
+            log_queue.task_done()
+            print(f"{CLR_CYAN}[Consumer {worker_id}] Poison pill received. Terminating thread execution...{CLR_RESET}")
+            break
+            
         clean_line = line.encode('ascii', 'ignore').decode('ascii').strip()
         
-        # Match only checks the very beginning of the string
-        match = LOG_LEVEL_PATTERN.match(clean_line)
-        
-        if match:
-            # Safely extract exactly what matched (ERROR or CRITICAL) from group 1
+        if LOG_LEVEL_PATTERN.match(clean_line):
+            match = LOG_LEVEL_PATTERN.match(clean_line)
             level = match.group(1).upper()
             color = CLR_RED if level == "CRITICAL" else CLR_YELLOW
             
             db_queue.put((level, clean_line))
             print(f"{color}!!! [Consumer {worker_id}] Detected legitimate {level} -> Offloading to Storage Layer{CLR_RESET}")
         else:
-            # Contextual text containing the word "error" inside the message will safely land here now!
-            print(f"{CLR_GRAY}[Consumer {worker_id}] Ignored: Info/Warning or contextual text event.{CLR_RESET}")
+            print(f"{CLR_GRAY}[Consumer {worker_id}] Ignored: Info/Warning event.{CLR_RESET}")
         
         log_queue.task_done()
 
@@ -131,15 +132,48 @@ def log_db_writer():
         db_queue.task_done()
     
     conn.close()
+
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=start_event_producer, daemon=True).start()
-    threading.Thread(target=log_db_writer, daemon=True).start()
-    for i in range(2): # 2 consumers is plenty for testing
-        threading.Thread(target=log_consumer, args=(i,), daemon=True).start()
+    
+    # 1. Initialize Thread Objects (Explicitly remove daemon=True from workers handling data)
+    producer_thread = threading.Thread(target=start_event_producer, daemon=True) # Producer can stay daemon
+    db_writer_thread = threading.Thread(target=log_db_writer, daemon=False)     # MUST finish its commits
+    
+    consumer_threads = []
+    for i in range(2):
+        t = threading.Thread(target=log_consumer, args=(i,), daemon=False)      # MUST finish reading current item
+        consumer_threads.append(t)
 
+    # 2. Start Threads
+    producer_thread.start()
+    db_writer_thread.start()
+    for t in consumer_threads:
+        t.start()
+
+    # 3. Wait for User Interruption
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[System] Shutdown.")
+        print("\n\n[System] Shutdown signal received. Initiating graceful termination...")
+        
+        # --- THE GRACEFUL SHUTDOWN SEQUENCE ---
+        
+        # Step A: Let Consumers finish whatever lines they already grabbed, then tell them to exit
+        print("[System] Phase 1: Signalling Consumers to halt...")
+        for _ in range(2):
+            log_queue.put(None) # Poison Pill for Consumers (We need to update log_consumer to look for this)
+            
+        for t in consumer_threads:
+            t.join() # Wait until both consumers process their poison pill and exit
+        print("[System] Phase 1 Complete: All Consumers successfully terminated.")
+
+        # Step B: Wait for the Consumer-to-DB queue to completely clear out
+        print("[System] Phase 2: Flushing remaining database queue entries...")
+        db_queue.put(None) # Trigger your poison pill inside log_db_writer
+        
+        db_writer_thread.join() # Wait for SQLite to finish writing every last alert and close cleanly
+        print("[System] Phase 2 Complete: Database layer safely persisted and connection closed.")
+        
+        print("[System] Shutdown successful. Zero data lost. Safe to exit.")
