@@ -1,7 +1,7 @@
 # Virtual environments
 venv/
 
-# Project-specific
-*.log
+# Database and Log Outputs
 output/
-logs/*.log
+logs/
+*.log
