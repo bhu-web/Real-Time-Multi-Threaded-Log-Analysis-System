@@ -12,7 +12,7 @@ messages = [
 ]
 
 with open("logs/server.log", "a") as f:
-    for i in range(10):
+    for i in range(5):
         level = random.choice(levels)
         msg = random.choice(messages)
         f.write(f"{level}: Simulated log entry #{i} - {msg}\n")

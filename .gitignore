@@ -1,0 +1,7 @@
+# Virtual environments
+venv/
+
+# Project-specific
+*.log
+output/
+logs/*.log
