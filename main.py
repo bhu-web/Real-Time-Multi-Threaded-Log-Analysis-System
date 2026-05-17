@@ -79,20 +79,27 @@ def start_event_producer():
     observer.join()
         
 def log_consumer(worker_id):
+    # This Regex looks ONLY at the start of the line (^) for the words, 
+    # followed immediately by a colon (:) or a space boundary.
+    LOG_LEVEL_PATTERN = re.compile(r"^(ERROR|CRITICAL):", re.IGNORECASE)
+
     while True:
         line = log_queue.get()
         clean_line = line.encode('ascii', 'ignore').decode('ascii').strip()
         
-        if re.search(r"ERROR|CRITICAL", clean_line, re.IGNORECASE):
-            level = "CRITICAL" if "CRITICAL" in clean_line.upper() else "ERROR"
+        # Match only checks the very beginning of the string
+        match = LOG_LEVEL_PATTERN.match(clean_line)
+        
+        if match:
+            # Safely extract exactly what matched (ERROR or CRITICAL) from group 1
+            level = match.group(1).upper()
             color = CLR_RED if level == "CRITICAL" else CLR_YELLOW
             
-            # Offload to DB queue with the actual text to be printed by the writer
             db_queue.put((level, clean_line))
-            print(f"{color}!!! [Consumer {worker_id}] Detected {level} -> Offloading to Storage Layer{CLR_RESET}")
+            print(f"{color}!!! [Consumer {worker_id}] Detected legitimate {level} -> Offloading to Storage Layer{CLR_RESET}")
         else:
-            # Kept quiet/dimmed so it doesn't overwhelm the screen
-            print(f"{CLR_GRAY}[Consumer {worker_id}] Ignored: Info/Warning event.{CLR_RESET}")
+            # Contextual text containing the word "error" inside the message will safely land here now!
+            print(f"{CLR_GRAY}[Consumer {worker_id}] Ignored: Info/Warning or contextual text event.{CLR_RESET}")
         
         log_queue.task_done()
 
