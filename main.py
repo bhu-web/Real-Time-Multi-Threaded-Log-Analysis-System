@@ -7,6 +7,14 @@ import sqlite3
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# ANSI Color Codes for Terminal Styling
+CLR_RESET  = "\033[0m"
+CLR_RED    = "\033[91m"    # Critical
+CLR_YELLOW = "\033[93m"    # Error
+CLR_GREEN  = "\033[92m"    # DB Success
+CLR_CYAN   = "\033[96m"    # Consumers
+CLR_GRAY   = "\033[90m"    # Ignored lines
+
 # SHARED INFRASTRUCTURE
 log_queue = queue.Queue(maxsize=50)
 # queue dedicated for database tasks
@@ -77,12 +85,14 @@ def log_consumer(worker_id):
         
         if re.search(r"ERROR|CRITICAL", clean_line, re.IGNORECASE):
             level = "CRITICAL" if "CRITICAL" in clean_line.upper() else "ERROR"
+            color = CLR_RED if level == "CRITICAL" else CLR_YELLOW
             
-            # INSTEAD OF CONNECTING TO DB, WE OFFLOAD TO THE DB QUEUE
+            # Offload to DB queue with the actual text to be printed by the writer
             db_queue.put((level, clean_line))
-            print(f"!!! [Consumer {worker_id}] Found {level}, offloading to DB queue.")
+            print(f"{color}!!! [Consumer {worker_id}] Detected {level} -> Offloading to Storage Layer{CLR_RESET}")
         else:
-            print(f"[Consumer {worker_id}] Ignored: '{clean_line}'")
+            # Kept quiet/dimmed so it doesn't overwhelm the screen
+            print(f"{CLR_GRAY}[Consumer {worker_id}] Ignored: Info/Warning event.{CLR_RESET}")
         
         log_queue.task_done()
 
@@ -95,23 +105,25 @@ def log_db_writer():
     cursor = conn.cursor()
     
     while True:
-        # Pulls the structured alert data from the db_queue
         alert_data = db_queue.get()
-        if alert_data is None:  # Poison pill to gracefully shut down if needed
+        if alert_data is None:
             break
             
         level, message = alert_data
         try:
             cursor.execute("INSERT INTO alerts (level, message) VALUES (?, ?)", (level, message))
             conn.commit()
-            print("--- [DB Writer] Successfully persisted alert to DB.")
+            
+            # --- MEANINGFUL TERMINAL OUTPUT ---
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"{CLR_GREEN}✓ [{timestamp}] [DB_STORE] Successfully persisted [{level}]: {message}{CLR_RESET}")
+            
         except sqlite3.OperationalError as e:
-            print(f"--- [DB Writer] Error writing to database: {e}")
+            print(f"{CLR_RED}❌ [DB_STORE] Operational Error writing to database: {e}{CLR_RESET}")
             
         db_queue.task_done()
     
     conn.close()
-
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=start_event_producer, daemon=True).start()
